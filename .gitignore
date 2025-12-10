@@ -1,0 +1,7 @@
+word-lists-main/
+dist/
+build/
+*.spec
+.venv/*
+debug.log
+error.log
