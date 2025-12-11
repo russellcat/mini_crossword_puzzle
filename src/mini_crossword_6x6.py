@@ -5,6 +5,7 @@ import os
 import sys
 import requests
 import traceback
+from openai import OpenAI
 
 # ------------------------------
 # CONFIGURATION
@@ -12,6 +13,10 @@ import traceback
 GRID_SIZE = 6
 WORD_MIN = 5
 WORD_MAX = 5
+
+#api_key = os.getenv("OPENAI_API_KEY")
+
+
 
 if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
     BASE_DIR = sys._MEIPASS
@@ -21,28 +26,60 @@ else:
 WORDLIST_PATH = os.path.join(BASE_DIR, "wordlist.txt")
 LOG_PATH = os.path.join(BASE_DIR, "debug.log")
 
-# Pattern explanation:
-# '.' = white cell, '#' = black cell
-#
-# Row 0: "..####"
-# Row 1: ".....#"
-# Row 2: "..####"
-# Row 3: ".....#"
-# Row 4: "..####"
-# Row 5: "######"
-#
-# Slots (all length 5):
-#  - Across: row1 (col0-4), row3 (col0-4)
-#  - Down:   col0 (row0-4), col1 (row0-4)
-#
-PATTERN = [
-    "..####",
+# Base pattern: 6x6, '.' = white, '#' = block
+# This one has 4 slots, all length 5:
+#  - Across: row1, row3
+#  - Down:   col0, col1
+BASE_PATTERN = [
+    "##....",
     ".....#",
     "..####",
     ".....#",
     "..####",
-    "######",
+    ".....#",
 ]
+
+# ------------------------------
+# PATTERN TRANSFORMS (RANDOM LAYOUTS)
+# ------------------------------
+def rotate_clockwise(pattern):
+    """Rotate NxN pattern 90 degrees clockwise."""
+    n = len(pattern)
+    return [
+        "".join(pattern[n - 1 - r][c] for r in range(n))
+        for c in range(n)
+    ]
+
+
+def flip_horizontal(pattern):
+    """Flip pattern left-right."""
+    return [row[::-1] for row in pattern]
+
+
+def flip_vertical(pattern):
+    """Flip pattern top-bottom."""
+    return list(reversed(pattern))
+
+
+def random_pattern(base_pattern):
+    """Return a randomized variant of base_pattern (rotations + flips)."""
+    p = list(base_pattern)
+
+    # Random rotation: 0, 90, 180, or 270 degrees
+    k = random.randint(0, 3)
+    for _ in range(k):
+        p = rotate_clockwise(p)
+
+    # Random horizontal flip
+    if random.random() < 0.5:
+        p = flip_horizontal(p)
+
+    # Random vertical flip
+    if random.random() < 0.5:
+        p = flip_vertical(p)
+
+    return p
+
 
 # ------------------------------
 # LOGGING
@@ -115,7 +152,7 @@ def build_slots(pattern):
     mask = [[c == "." for c in row] for row in pattern]
     slots = []
 
-    # Across
+    # Across slots
     for r in range(grid_size):
         c = 0
         while c < grid_size:
@@ -129,7 +166,7 @@ def build_slots(pattern):
             else:
                 c += 1
 
-    # Down
+    # Down slots
     for c in range(grid_size):
         r = 0
         while r < grid_size:
@@ -147,6 +184,7 @@ def build_slots(pattern):
 
 
 def assign_numbers(mask, slots):
+    """Number only *real* slots, no stray numbers."""
     grid_size = len(mask)
     number_grid = [[0] * grid_size for _ in range(grid_size)]
 
@@ -164,7 +202,6 @@ def assign_numbers(mask, slots):
             has_across = (r, c, "across") in start_map
             has_down   = (r, c, "down")   in start_map
 
-            # Only number if there is at least one *real* slot starting here
             if has_across or has_down:
                 number_grid[r][c] = num
                 if has_across:
@@ -207,7 +244,6 @@ def fill_crossword(mask, slots, words_by_length,
             grid[rr][cc] = ch
         slot["word"] = word
 
-    # All slots are length 5 in this pattern
     slots_copy = [dict(s) for s in slots]
 
     for attempt in range(max_restarts):
@@ -251,37 +287,38 @@ def fill_crossword(mask, slots, words_by_length,
 # ------------------------------
 # GUI
 # ------------------------------
-def build_gui(grid, number_grid, slots_with_clues):
+def build_gui(grid, number_grid, slots_with_clues, pattern_used):
     root = tk.Tk()
     root.title("Mini Crossword 6×6")
+
+    # Optional: show which pattern index was used (for debugging)
+    # root.title(f"Mini Crossword 6×6 – pattern variant")
 
     frame = tk.Frame(root)
     frame.pack(padx=10, pady=10)
 
     entry_grid = [[None for _ in range(GRID_SIZE)] for _ in range(GRID_SIZE)]
 
-    CELL_SIZE = 60  # total cell size in pixels
+    CELL_SIZE = 40  # total cell size in pixels
 
     for r in range(GRID_SIZE):
         for c in range(GRID_SIZE):
             is_block = grid[r][c] is None
 
-            # --- Container for this cell ---
             cell_bg = "black" if is_block else "white"
-            cell = tk.Frame(frame, width=CELL_SIZE, height=CELL_SIZE, bg=cell_bg, bd=1, relief="solid")
+            cell = tk.Frame(frame, width=CELL_SIZE, height=CELL_SIZE,
+                            bg=cell_bg, bd=1, relief="solid")
             cell.grid(row=r, column=c, padx=1, pady=1)
-            cell.grid_propagate(False)  # keep fixed size
+            cell.grid_propagate(False)
 
             if is_block:
-                # Just a black square
                 continue
 
-            # Use a 2-row grid inside the cell: [number][entry]
             cell.rowconfigure(0, weight=1)
             cell.rowconfigure(1, weight=3)
             cell.columnconfigure(0, weight=1)
 
-            # --- Number label (if any) ---
+            # Number label (small, top-left)
             if number_grid[r][c]:
                 num_label = tk.Label(
                     cell,
@@ -293,7 +330,7 @@ def build_gui(grid, number_grid, slots_with_clues):
                 )
                 num_label.grid(row=0, column=0, sticky="nw", padx=1, pady=0)
 
-            # --- Entry for the letter ---
+            # Entry for the letter
             e = tk.Entry(
                 cell,
                 width=2,
@@ -363,6 +400,11 @@ def build_gui(grid, number_grid, slots_with_clues):
 # MAIN
 # ------------------------------
 def main():
+
+    #client = OpenAI()
+    #response = client.responses.create(model="gpt-4o-mini", input="Say hello")
+    #log(response.output_text)
+
     with open(LOG_PATH, "w", encoding="utf-8") as f:
         f.write("=== Mini crossword starting ===\n")
 
@@ -374,7 +416,11 @@ def main():
         words_by_length = build_wordlists(words)
         log(f"Loaded {len(words)} words.")
 
-        mask, slots = build_slots(PATTERN)
+        # Pick a random pattern variant
+        pattern = random_pattern(BASE_PATTERN)
+        log(f"Pattern used: {pattern}")
+
+        mask, slots = build_slots(pattern)
         log(f"Slots: {len(slots)}")
         for s in slots:
             log(f"Slot: {s}")
@@ -394,7 +440,7 @@ def main():
         for s in slots_filled:
             s["clue"] = get_definition(s["word"])
 
-        build_gui(grid, number_grid, slots_filled)
+        build_gui(grid, number_grid, slots_filled, pattern_used=pattern)
 
     except Exception as e:
         traceback.print_exc()
