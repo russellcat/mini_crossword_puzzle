@@ -14,9 +14,6 @@ GRID_SIZE = 6
 WORD_MIN = 5
 WORD_MAX = 5
 
-#api_key = os.getenv("OPENAI_API_KEY")
-
-
 
 if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
     BASE_DIR = sys._MEIPASS
@@ -143,45 +140,148 @@ def get_definition(word: str) -> str:
 
     return "No clue available."
 
+# ------------------------------
+# LLM-BASED CLUE GENERATION
+# ------------------------------
+
+def get_llm_clue(word: str, base_definition: str | None = None) -> str:
+    """
+    Use OpenAI to generate a fun crossword-style clue.
+
+    - Uses the Responses API via the OpenAI Python SDK.
+    - If anything fails (no key, quota, network), falls back to base_definition
+      or a generic safe clue.
+    """
+    try:
+        api_key = os.getenv("OPENAI_API_KEY")
+        if not api_key:
+            # No key -> we cannot call OpenAI
+            return base_definition or f"A word related to '{word}'."
+
+        client = OpenAI()  # Reads OPENAI_API_KEY from environment
+
+        # You can customise this "profile" if you like later
+        user_profile = "The solver likes fantasy, and nature, and puzzles."
+
+        if base_definition:
+            prompt = (
+                f"You are writing clues for a small, friendly crossword puzzle.\n"
+                f"{user_profile}\n\n"
+                f"Target word: {word}\n"
+                f"Dictionary-style definition: {base_definition}\n\n"
+                f"Write ONE fun, concise crossword clue, in the style of the new york times mini crossword clues (max 12 words).\n"
+                f"- Do NOT include the word itself or obvious rhymes.\n"
+                f"- Keep it easy, not too cryptic.\n"
+                f"- Slightly playful tone is okay.\n"
+                f"- Output only the clue text, no quotes, no extra commentary."
+            )
+        else:
+            prompt = (
+                f"You are writing clues for a small, friendly crossword puzzle.\n"
+                f"{user_profile}\n\n"
+                f"Target word: {word}\n\n"
+                f"Write ONE fun, concise crossword clue, in the style of the new york times mini crossword clues (max 12 words).\n"
+                f"- Do NOT include the word itself or obvious rhymes.\n"
+                f"- Keep it easy, not too cryptic.\n"
+                f"- Slightly playful tone is okay.\n"
+                f"- Output only the clue text, no quotes, no extra commentary."
+            )
+
+        response = client.responses.create(
+            model="gpt-4o-mini",  # or another model you've enabled
+            input=prompt,
+        )
+
+        # New SDK gives you a convenience helper:
+        clue_text = response.output_text.strip()
+
+        if not clue_text:
+            return base_definition or f"A word related to '{word}'."
+
+        return clue_text
+
+    except Exception as e:
+        # Never crash the app because of AI issues; just log and fall back
+        log(f"LLM clue error for {word}: {e}")
+        return base_definition or f"A word related to '{word}'."
 
 # ------------------------------
 # BUILD MASK AND SLOTS
 # ------------------------------
 def build_slots(pattern):
+    """
+    Build mask and slots from a pattern, then
+    remove any 'orphan' white cells that do not belong
+    to a valid slot (length between WORD_MIN and WORD_MAX).
+    """
     grid_size = len(pattern)
     mask = [[c == "." for c in row] for row in pattern]
-    slots = []
 
-    # Across slots
-    for r in range(grid_size):
-        c = 0
-        while c < grid_size:
-            if mask[r][c] and (c == 0 or not mask[r][c - 1]):
-                start = c
-                while c < grid_size and mask[r][c]:
+    def slots_from_mask(mask_in):
+        slots_out = []
+
+        # Across
+        for r in range(grid_size):
+            c = 0
+            while c < grid_size:
+                if mask_in[r][c] and (c == 0 or not mask_in[r][c - 1]):
+                    start = c
+                    while c < grid_size and mask_in[r][c]:
+                        c += 1
+                    length = c - start
+                    if WORD_MIN <= length <= WORD_MAX:
+                        slots_out.append({
+                            "dir": "across",
+                            "row": r,
+                            "col": start,
+                            "length": length,
+                        })
+                else:
                     c += 1
-                L = c - start
-                if WORD_MIN <= L <= WORD_MAX:
-                    slots.append({"dir": "across", "row": r, "col": start, "length": L})
-            else:
-                c += 1
 
-    # Down slots
-    for c in range(grid_size):
-        r = 0
-        while r < grid_size:
-            if mask[r][c] and (r == 0 or not mask[r - 1][c]):
-                start = r
-                while r < grid_size and mask[r][c]:
+        # Down
+        for c in range(grid_size):
+            r = 0
+            while r < grid_size:
+                if mask_in[r][c] and (r == 0 or not mask_in[r - 1][c]):
+                    start = r
+                    while r < grid_size and mask_in[r][c]:
+                        r += 1
+                    length = r - start
+                    if WORD_MIN <= length <= WORD_MAX:
+                        slots_out.append({
+                            "dir": "down",
+                            "row": start,
+                            "col": c,
+                            "length": length,
+                        })
+                else:
                     r += 1
-                L = r - start
-                if WORD_MIN <= L <= WORD_MAX:
-                    slots.append({"dir": "down", "row": start, "col": c, "length": L})
-            else:
-                r += 1
 
-    return mask, slots
+        return slots_out
 
+    # 1) First pass: find slots from the raw mask
+    initial_slots = slots_from_mask(mask)
+
+    # 2) Mark which cells are actually used by at least one valid slot
+    used = [[False] * grid_size for _ in range(grid_size)]
+    for s in initial_slots:
+        r, c, d, length = s["row"], s["col"], s["dir"], s["length"]
+        for i in range(length):
+            rr = r + (i if d == "down" else 0)
+            cc = c + (i if d == "across" else 0)
+            used[rr][cc] = True
+
+    # 3) Any white cell not used by any slot becomes a block
+    for r in range(grid_size):
+        for c in range(grid_size):
+            if mask[r][c] and not used[r][c]:
+                mask[r][c] = False  # turn into black cell
+
+    # 4) Recompute slots based on the cleaned mask
+    final_slots = slots_from_mask(mask)
+
+    return mask, final_slots
 
 def assign_numbers(mask, slots):
     """Number only *real* slots, no stray numbers."""
@@ -401,10 +501,6 @@ def build_gui(grid, number_grid, slots_with_clues, pattern_used):
 # ------------------------------
 def main():
 
-    #client = OpenAI()
-    #response = client.responses.create(model="gpt-4o-mini", input="Say hello")
-    #log(response.output_text)
-
     with open(LOG_PATH, "w", encoding="utf-8") as f:
         f.write("=== Mini crossword starting ===\n")
 
@@ -435,10 +531,18 @@ def main():
             messagebox.showerror("Error", "Failed to fill crossword with current wordlist.")
             return
 
-        # Fetch clues
         log("Fetching clues...")
         for s in slots_filled:
-            s["clue"] = get_definition(s["word"])
+            word = s["word"]
+
+            # 1) Get a safe dictionary-style definition
+            base_def = get_definition(word)
+
+            # 2) Ask the LLM to jazz it up
+            fancy_clue = get_llm_clue(word, base_definition=base_def)
+
+            # 3) Use the LLM clue as the one shown in the UI
+            s["clue"] = fancy_clue
 
         build_gui(grid, number_grid, slots_filled, pattern_used=pattern)
 
